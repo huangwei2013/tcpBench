@@ -1,0 +1,367 @@
+#include <netinet/in.h>    // for sockaddr_in
+#include <sys/types.h>    // for socket
+#include <sys/socket.h>    // for socket
+#include <stdio.h>        // for printf
+#include <stdlib.h>        // for exit
+#include <string.h>        // for bzero
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+
+#define random(x) (rand()%x)
+
+#define BUFFER_SIZE 1024
+
+ 
+typedef struct client_param {
+    char* ip;
+    int port;
+    char* data;
+    char* expected_ret;
+    int conn_type;
+    int sleep;
+    int times_per_concurrent;
+}client_param; 
+
+//传给client线程的参数
+typedef struct client_param_ex {
+    int no;
+    client_param* cp;
+}client_param_ex;
+  
+//配置
+typedef struct {
+    int concurrent;             //并发度，由线程实现
+    int times_per_concurrent;   //每个并发线程执行的次数
+    int conn_type;              //连接类型：1:短连；2:长连
+    int sleep;                  //长连接时，保持的时长： >0 表示休眠秒数; =0 表示永不断开                  
+    int show_help;              //显示说明
+    
+    char* remote_ip;            //对端IP
+    int remote_port;            //对端端口
+    char* send_data;            //要发送的数据(字符串形式)
+    char* send_file;            //要发送的数据(文件形式)
+    char* expected_ret;         //期待的返回内容
+    
+}client_conf_t;  
+ 
+//单个线程的结果
+typedef struct{
+    int total;                  //所有发送数
+    int succ;                   //成功数
+
+}client_result_t; 
+ 
+//默认配置 
+client_conf_t client_conf = {1,1,1,0,0,NULL,0,NULL,NULL,NULL}; 
+client_result_t client_result = {0,0};
+ 
+void show_conf()
+{
+    printf("------------------------------------------------------------------------\n");
+    printf("    threads             :   %d\n",client_conf.concurrent);
+    printf("    sends per thread    :   %d\n",client_conf.times_per_concurrent);
+    printf("    conn_type           :   %d\n",client_conf.conn_type);
+    printf("    sleep               :   %d\n",client_conf.sleep);
+    printf("    show_help           :   %d\n",client_conf.show_help);
+    printf("    remote ip           :   %s\n",client_conf.remote_ip);
+    printf("    remote port         :   %d\n",client_conf.remote_port);
+    printf("    send data           :   %s\n",client_conf.send_data);
+    printf("    send file           :   %s\n",client_conf.send_file);
+    printf("    expected return msg :   %s\n",client_conf.expected_ret);
+    printf("------------------------------------------------------------------------\n");
+} 
+
+void show_result()
+{
+    printf("------------------------------------------------------------------------\n");
+    printf("    total               :   %d\n",client_result.total);
+    printf("    succ                :   %d\n",client_result.succ);
+    printf("------------------------------------------------------------------------\n");
+}
+ 
+int interact(int nSocket, char* pData, char* expected_ret)
+{
+    //printf(" send : %s, %d\n", pData, (int)strlen(pData));
+    
+    ssize_t sendLen = send(nSocket,pData,strlen(pData),0);
+    if(sendLen != strlen(pData)){
+        printf("Send err\n");
+        return 0;
+    }
+
+    char buffer[BUFFER_SIZE];
+    bzero(buffer,BUFFER_SIZE);
+    int recvLen = 0;
+    while( recvLen = recv(nSocket,buffer,BUFFER_SIZE,0))
+    {
+        if(recvLen < 0)
+        {
+            break;
+        } else if(recvLen == 0) {
+            break;
+        }
+    }
+
+    if(NULL != expected_ret){
+        return ( 0 == strncmp(expected_ret, buffer, strlen(expected_ret)))? 1 : 0;
+    }
+    return 1;
+} 
+
+ 
+
+static void* client(void* p)
+{
+    client_param_ex* cp_ex = p;
+    client_param* cp = cp_ex->cp;
+    struct timeval timeout = {3,0}; 
+    
+    struct sockaddr_in client_addr;
+    bzero(&client_addr,sizeof(client_addr)); 
+    client_addr.sin_family = AF_INET;   
+    client_addr.sin_addr.s_addr = htons(INADDR_ANY);
+    client_addr.sin_port = htons(0);    //0让系统自动分配一个空闲端口
+    
+    int client_socket = socket(AF_INET,SOCK_STREAM,0);
+    if( client_socket < 0)
+    {
+        printf("Create Socket Failed!\n");
+        return;
+    }
+    
+    if( bind(client_socket,(struct sockaddr*)&client_addr,sizeof(client_addr)))
+    {
+        printf("Client Bind Port Failed!\n"); 
+        return;
+    }
+    
+     //设置超时
+    setsockopt(client_socket,SOL_SOCKET, SO_SNDTIMEO,(void *)&timeout,sizeof(struct timeval));
+    setsockopt(client_socket,SOL_SOCKET, SO_RCVTIMEO,(void *)&timeout,sizeof(struct timeval));
+ 
+    struct sockaddr_in server_addr;
+    bzero(&server_addr,sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    if(inet_aton(cp->ip, &server_addr.sin_addr) == 0)
+    {
+        printf("Server IP Address Error!\n");
+        return;
+    }
+    server_addr.sin_port = htons(cp->port);
+    socklen_t server_addr_length = sizeof(server_addr);
+  
+    unsigned long ul = 0;
+    ioctl(client_socket, FIONBIO, &ul); 
+    
+    // connect to server
+    int conn = connect(client_socket, (struct sockaddr*)&server_addr, server_addr_length);
+    if( conn < 0)
+    {
+        printf("Can Not Connect To %s:%d As %d! \n", cp->ip, cp->port, conn);
+        fprintf(stderr,"error in CreateProcess %d[%s]\n", errno,strerror(errno));
+        return;
+    }
+
+    int count_succ = 0;
+    if(2 == cp->conn_type){
+        int times = 0;
+        for(; times < cp->times_per_concurrent; times++){
+            count_succ += interact(client_socket, cp->data, cp->expected_ret);
+        }
+        //printf("Work done, sleeping...\n");
+        usleep(1000*1000*cp->sleep);
+    }else if(3 == cp->conn_type){
+        cp->sleep = (0==cp->sleep)?3:cp->sleep;
+        int times = 0;
+        srand((int)time(0));
+        for(; times < cp->times_per_concurrent; times++){
+            count_succ += interact(client_socket, cp->data, cp->expected_ret);
+
+            usleep(1000*1000*random(cp->sleep));
+        }
+    }else if (4 == cp->conn_type){
+        usleep(1000*1000*cp->sleep);
+    }
+    
+    close(client_socket); 
+    
+    //printf("total : %d, succ : %d\n", cp->times_per_concurrent, count_succ);
+    client_result.total += cp->times_per_concurrent;
+    client_result.succ += count_succ;
+} 
+ 
+
+
+void threadManager(int count, client_param cp) 
+{
+    pthread_t tids[count];
+    int i;
+    
+    clock_t start, finish;
+    start = clock();
+    for(i = 1; i <= count; i++){
+        client_param_ex cp_ex = {i, &cp};
+        printf("pthread no : %d\n", i);
+        pthread_create(&tids[i], NULL, client, (void *)&cp_ex);
+        
+        //test
+        if( 0 == i%100 )
+            sleep(1);
+    }   
+    finish = clock();
+     
+    double duration = (double)(finish - start) / CLOCKS_PER_SEC; 
+    printf("threads : %d, each thread : %d, seconds : %f\n", count, cp.times_per_concurrent, duration);
+    for(i = 1; i <= count; i++){
+       pthread_join(tids[i], NULL);
+    }   
+    show_result();
+}
+
+void read_from_file(char* file_name, char*  pData)
+{
+    FILE *fp;
+
+    fp = fopen(file_name,"r"); // read mode
+    if( fp == NULL ){
+      perror("Error while opening the file.\n");
+      exit(EXIT_FAILURE);
+    }
+
+    fgets(pData, BUFFER_SIZE, (FILE*)fp);
+    fclose(fp);
+    
+    return ;
+}
+
+int str2int(char* str)
+{
+    return (int)strtol(str, NULL, 10);
+}
+
+void help()
+{
+    printf("Usage: \n");
+    printf("\t-h127.0.0.1 -p11  :   remote IP & Port\n");
+    printf("\t-c10              :   Concurrent.\n");
+    printf("\t                          [Default]1 \n");
+    printf("\t-n50              :   Number of requests\n");
+    printf("\t                          [Default]1\n");
+    printf("\t-t2               :   Connection type\n");
+    printf("\t                          [Default]1 Short-Connection\n");
+    printf("\t                          2 Long-Connection\n");
+    printf("\t                          3 Long-Connection and random sends\n");
+    printf("\t                          5 Long-Connection and send nothing\n");
+    printf("\t-s600             :   Seconds keepping connections.\n");
+    printf("\t                          t=1, doesn't work\n");
+    printf("\t                          t=2, seconds keepping connections.\n");
+    printf("\t                          t=3, max seconds.\n");
+    printf("\t                               [Default]3\n");
+    printf("\t                          t=4, seconds keepping connections.\n");
+    printf("\t-d\"data to send\"\n");
+    printf("\t-f\"file to send\"\n");
+    printf("\t-e\"expected return data\"\n");
+}
+
+int parse_options(int argc, char** argv)
+{
+    char* p;
+    int   i;
+
+    for (i = 1; i < argc; i++) {
+
+        p = (char *) argv[i];
+        if (*p++ != '-') {
+            printf("invalid option: \"%s\"\n", argv[i]);
+            return -1;
+        }
+
+        while (*p) {
+            switch (*p++) {
+
+                case '?':
+                    client_conf.show_help = 1;
+                    goto next;
+                    break;
+                case 'h':
+                    client_conf.remote_ip = p++;
+                    goto next;
+                    break;
+                case 'p':
+                    client_conf.remote_port = str2int((char *) p);
+                    goto next;
+                    break;
+                case 'd':
+                    client_conf.send_data = p++;
+                    goto next;
+                    break;   
+                case 'f':
+                    client_conf.send_file = p++;
+                    goto next;                    
+                    break;    
+                case 'e':
+                    client_conf.expected_ret = p++;
+                    goto next;                    
+                    break; 
+                case 't':
+                    client_conf.conn_type = str2int((char *) p);
+                    goto next;
+                    break;   
+                case 's':
+                    client_conf.sleep = str2int((char *) p);
+                    goto next;                    
+                    break;                      
+                case 'c':
+                    if (*p) {
+                        client_conf.concurrent = str2int((char *) p);
+                        goto next;
+                    }
+                    break;
+                case 'n':
+                    if (*p) {
+                        client_conf.times_per_concurrent = str2int((char *) p);
+                        goto next;
+                    }
+                    break;
+                default:
+                    printf("invalid option: \"%c\"\n", *(p - 1));
+                    break;
+            }
+        }
+
+    next:
+        continue;
+    }
+
+    return 0;
+}
+ 
+int main(int argc, char **argv)
+{
+    parse_options(argc, argv);
+    
+    if((argc < 2) || client_conf.show_help 
+        || NULL == client_conf.remote_ip || 0 == client_conf.remote_port 
+    ){
+        help();
+        exit(0);
+    }
+
+    if( NULL == client_conf.send_data || NULL != client_conf.send_file){
+        client_conf.send_data = (char *)malloc(BUFFER_SIZE * sizeof(char));
+        read_from_file(client_conf.send_file, client_conf.send_data);
+    } else if (NULL == client_conf.send_data &&  NULL == client_conf.send_file){
+        help();
+        exit(0);
+    }
+    
+    show_conf();
+    
+    client_param cp = {client_conf.remote_ip, client_conf.remote_port, client_conf.send_data, client_conf.expected_ret, client_conf.conn_type, client_conf.sleep, client_conf.times_per_concurrent};    
+    threadManager(client_conf.concurrent, cp);
+    
+    return 0;
+}
